@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101820">
+<title>Lightning Roulette Motion Lab</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eef3f6;background:#101820}
+body{margin:0;background:linear-gradient(180deg,#142532,#0c1319);min-height:100vh}
+main{max-width:760px;margin:auto;padding:18px}
+h1{font-size:25px;margin:8px 0}.sub{color:#aebbc4;font-size:14px;line-height:1.45}
+.card{background:#182b37;border:1px solid #2b4350;border-radius:16px;padding:16px;margin:14px 0;box-shadow:0 8px 25px #0003}
+input[type=file]{width:100%;box-sizing:border-box;padding:14px;background:#10202a;border:1px dashed #496270;border-radius:12px;color:#fff}
+button{border:0;border-radius:12px;padding:13px 16px;font-weight:700;font-size:15px;margin:6px 4px 0 0;background:#25d366;color:#06100a}
+button.secondary{background:#2c4654;color:#fff}button:disabled{opacity:.45}
+video{width:100%;max-height:55vh;background:#000;border-radius:12px;margin-top:12px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.metric{background:#10202a;border-radius:12px;padding:12px}.metric b{display:block;font-size:20px;margin-top:5px}
+label{font-size:13px;color:#b7c6ce;display:block;margin:10px 0 5px}
+input[type=number]{width:100%;box-sizing:border-box;background:#10202a;border:1px solid #3b5663;color:#fff;border-radius:9px;padding:10px}
+progress{width:100%;height:10px}
+small{color:#8fa1ab}.warn{color:#ffd166}.ok{color:#7ee787}
+canvas{display:none}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:7px;border-bottom:1px solid #29414d}
+</style>
+</head>
+<body>
+<main>
+<h1>🎡 Lightning Roulette Motion Lab</h1>
+<div class="sub">Browser-only video analysis for research. Upload a roulette video in Safari; the video stays in your browser and is processed locally.</div>
+
+<div class="card">
+<h2>1. Upload video</h2>
+<input id="file" type="file" accept="video/*">
+<video id="video" controls playsinline></video>
+<div>
+<button id="analyze" disabled>Analyze video</button>
+<button id="stop" class="secondary" disabled>Stop</button>
+</div>
+<p id="status"><small>Choose a video to begin.</small></p>
+<progress id="progress" value="0" max="100"></progress>
+</div>
+
+<div class="card">
+<h2>2. Wheel calibration</h2>
+<div class="sub">For best results, use the first frame and enter the wheel center and radius in pixels. If you don't know them, leave the automatic defaults.</div>
+<div class="grid">
+<div><label>Center X</label><input id="cx" type="number" placeholder="auto"></div>
+<div><label>Center Y</label><input id="cy" type="number" placeholder="auto"></div>
+<div><label>Radius</label><input id="radius" type="number" placeholder="auto"></div>
+<div><label>Sample ring width</label><input id="ring" type="number" value="55"></div>
+</div>
+</div>
+
+<div class="card">
+<h2>3. Results</h2>
+<div class="grid">
+<div class="metric">Wheel RPM<b id="wheelRpm">—</b></div>
+<div class="metric">Ball RPM<b id="ballRpm">—</b></div>
+<div class="metric">Wheel RPS<b id="wheelRps">—</b></div>
+<div class="metric">Relative RPM<b id="relativeRpm">—</b></div>
+<div class="metric">Wheel decel<b id="wheelDecel">—</b></div>
+<div class="metric">Ball decel<b id="ballDecel">—</b></div>
+</div>
+<p id="pocket"><b>Approximate pocket:</b> —</p>
+<p class="warn">⚠ Pocket output is a geometric estimate. It is not a guaranteed prediction and requires zero-position calibration for a true pocket number.</p>
+</div>
+
+<div class="card">
+<h2>4. Export</h2>
+<button id="csv" class="secondary" disabled>Download measurements CSV</button>
+<button id="json" class="secondary" disabled>Download summary JSON</button>
+<div class="sub">The export contains frame/time, wheel speed, ball speed, relative speed and ball-position measurements.</div>
+</div>
+
+<canvas id="work"></canvas>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script>
+const EUROPEAN=[0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26];
+const fileEl=document.getElementById('file'), video=document.getElementById('video');
+const analyzeBtn=document.getElementById('analyze'), stopBtn=document.getElementById('stop');
+const statusEl=document.getElementById('status'), progress=document.getElementById('progress');
+const canvas=document.getElementById('work'), ctx=canvas.getContext('2d',{willReadFrequently:true});
+let url=null, running=false, rows=[], videoMeta={};
+
+function setStatus(s){statusEl.innerHTML='<small>'+s+'</small>'}
+function finiteMedian(a){a=a.filter(Number.isFinite).sort((x,y)=>x-y);return a.length?a[Math.floor(a.length/2)]:NaN}
+function fmt(x,n=2){return Number.isFinite(x)?x.toFixed(n):'—'}
+function download(name,text,type){
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([text],{type}));
+  a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)
+}
+fileEl.onchange=()=>{
+  const f=fileEl.files[0]; if(!f)return;
+  if(url)URL.revokeObjectURL(url); url=URL.createObjectURL(f); video.src=url;
+  videoMeta={name:f.name,size:f.size,type:f.type};
+  video.onloadedmetadata=()=>{
+    analyzeBtn.disabled=false;
+    setStatus(`Ready: ${video.videoWidth}×${video.videoHeight}, ${video.duration.toFixed(1)} s`);
+  };
+};
+
+function getCalibration(){
+  const w=video.videoWidth,h=video.videoHeight;
+  const cx=parseFloat(document.getElementById('cx').value)||w/2;
+  const cy=parseFloat(document.getElementById('cy').value)||h/2;
+  const radius=parseFloat(document.getElementById('radius').value)||Math.min(w,h)*.40;
+  const ring=parseFloat(document.getElementById('ring').value)||55;
+  return {cx,cy,radius,ring};
+}
+function angle(cx,cy,x,y){return Math.atan2(-(y-cy),x-cx)}
+function unwrap(prev,cur){let d=Math.atan2(Math.sin(cur-prev),Math.cos(cur-prev));return prev+d}
+function pocketFromAngle(a){
+  const turns=((a%(2*Math.PI))+2*Math.PI)%(2*Math.PI)/(2*Math.PI);
+  return EUROPEAN[Math.round(turns*37)%37];
+}
+function regression(t,a){
+  if(t.length<4)return NaN;
+  const n=t.length, mt=t.reduce((x,y)=>x+y,0)/n, ma=a.reduce((x,y)=>x+y,0)/n;
+  let num=0,den=0;for(let i=0;i<n;i++){num+=(t[i]-mt)*(a[i]-ma);den+=(t[i]-mt)**2}
+  return den?num/den:NaN
+}
+function median(arr){return finiteMedian(arr)}
+function updateMetric(id,v){document.getElementById(id).textContent=fmt(v)}
+function linearDecel(t,omega){
+  if(t.length<8)return NaN;
+  const n=t.length,k=Math.min(40,Math.floor(n/3));
+  const s1=regression(t.slice(0,k),omega.slice(0,k));
+  const s2=regression(t.slice(-k),omega.slice(-k));
+  const dt=t[t.length-1]-t[0]; return dt? (s2-s1)/dt : NaN;
+}
+
+async function analyze(){
+  if(!window.cv){setStatus('OpenCV.js is still loading. Wait a moment and try again.');return}
+  running=true; analyzeBtn.disabled=true;stopBtn.disabled=false;rows=[];progress.value=0;
+  const cal=getCalibration(), w=video.videoWidth,h=video.videoHeight,fps=30;
+  canvas.width=w;canvas.height=h;
+  video.currentTime=0; await new Promise(r=>video.onseeked=r);
+  let prevGray=null, wheelAngle=0, ballAngle=null;
+  const wheelAngles=[],wheelTimes=[],ballAngles=[],ballTimes=[];
+  const duration=video.duration, step=1/fps;
+  setStatus('Analyzing frames locally in Safari…');
+
+  for(let t=0;t<duration && running;t+=step){
+    video.currentTime=Math.min(t,duration-.001);
+    await new Promise(r=>video.onseeked=r);
+    ctx.drawImage(video,0,0,w,h);
+    const src=cv.imread(canvas), gray=new cv.Mat();
+    cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray,gray,new cv.Size(7,7),0);
+
+    // Wheel motion: use bright/contrasting features on a circular annulus.
+    let dtheta=NaN;
+    if(prevGray){
+      const mask=cv.Mat.zeros(h,w,cv.CV_8UC1);
+      cv.circle(mask,new cv.Point(cal.cx,cal.cy),cal.radius,255,-1);
+      cv.circle(mask,new cv.Point(cal.cx,cal.cy),Math.max(1,cal.radius-cal.ring),0,-1);
+      let pts=new cv.Mat();
+      cv.goodFeaturesToTrack(prevGray,pts,160,.01,8,mask,7,false,.04);
+      if(pts.rows>=8){
+        let next=new cv.Mat(),st=new cv.Mat(),err=new cv.Mat();
+        let criteria=new cv.TermCriteria(cv.TERM_CRITERIA_EPS|cv.TERM_CRITERIA_COUNT,20,.01);
+        cv.calcOpticalFlowPyrLK(prevGray,gray,pts,next,st,err,new cv.Size(21,21),3,criteria);
+        let ds=[];
+        for(let i=0;i<pts.rows;i++) if(st.data[i]){
+          const x1=pts.data32F[i*2],y1=pts.data32F[i*2+1],x2=next.data32F[i*2],y2=next.data32F[i*2+1];
+          const a1=angle(cal.cx,cal.cy,x1,y1),a2=angle(cal.cx,cal.cy,x2,y2);
+          ds.push(Math.atan2(Math.sin(a2-a1),Math.cos(a2-a1)));
+        }
+        if(ds.length>=8)dtheta=median(ds);
+        pts.delete();next.delete();st.delete();err.delete();
+      }
+      mask.delete();
+    }
+    if(Number.isFinite(dtheta))wheelAngle+=dtheta;
+
+    // Ball: Hough circles; choose the brightest plausible circle near outer track.
+    let ball=null;
+    let circles=new cv.Mat();
+    cv.HoughCircles(gray,circles,cv.HOUGH_GRADIENT,1.2,12,100,16,3,18);
+    let best=null,bestScore=-Infinity;
+    for(let i=0;i<circles.cols;i++){
+      const x=circles.data32F[i*3],y=circles.data32F[i*3+1],r=circles.data32F[i*3+2];
+      const dist=Math.hypot(x-cal.cx,y-cal.cy);
+      if(dist<cal.radius*.55||dist>cal.radius*1.15)continue;
+      const score=gray.ucharPtr(Math.max(0,Math.min(h-1,Math.round(y))),Math.max(0,Math.min(w-1,Math.round(x))))[0];
+      if(score>bestScore){bestScore=score;best={x,y,r}}
+    }
+    if(best){
+      const a=angle(cal.cx,cal.cy,best.x,best.y);
+      if(ballAngle===null)ballAngle=a;else ballAngle=unwrap(ballAngle,a);
+      ballAngles.push(ballAngle);ballTimes.push(t);
+      ball={x:best.x,y:best.y,r:best.r};
+    }
+
+    wheelAngles.push(wheelAngle);wheelTimes.push(t);
+    const recentW=wheelAngles.slice(-12),recentT=wheelTimes.slice(-12);
+    const recentB=ballAngles.slice(-12),recentBT=ballTimes.slice(-12);
+    const wRad=regression(recentT,recentW),bRad=regression(recentBT,recentB);
+    const wrpm=wRad*60/(2*Math.PI),brpm=bRad*60/(2*Math.PI);
+    rows.push({frame:Math.round(t*fps),time_s:t,wheel_rpm:wrpm,ball_rpm:brpm,
+      wheel_rps:wRad/(2*Math.PI),relative_rpm:(brpm-wrpm),ball_x:ball?.x??null,ball_y:ball?.y??null,
+      ball_angle:ballAngle,pocket_estimate:ballAngle===null?null:pocketFromAngle(ballAngle)});
+
+    src.delete();gray.delete();circles.delete();prevGray=gray; // placeholder; replaced below
+    // OpenCV Mat was deleted above; use a fresh grayscale copy for next iteration.
+    // Re-read current frame to keep memory ownership simple.
+    ctx.drawImage(video,0,0,w,h); const p=cv.imread(canvas),pg=new cv.Mat();cv.cvtColor(p,pg,cv.COLOR_RGBA2GRAY);cv.GaussianBlur(pg,pg,new cv.Size(7,7),0);prevGray=pg;p.delete();
+
+    progress.value=Math.min(100,t/duration*100);
+    if(Math.round(t*fps)%30===0)setStatus(`Analyzed ${Math.round(t)} / ${Math.ceil(duration)} seconds…`);
+  }
+  if(prevGray)prevGray.delete();
+  running=false;stopBtn.disabled=true;analyzeBtn.disabled=false;progress.value=100;
+  const wr=rows.map(x=>x.wheel_rpm),br=rows.map(x=>x.ball_rpm),rr=rows.map(x=>x.relative_rpm);
+  updateMetric('wheelRpm',median(wr));updateMetric('ballRpm',median(br));updateMetric('wheelRps',median(rows.map(x=>x.wheel_rps)));updateMetric('relativeRpm',median(rr));
+  const wt=rows.map(x=>x.time_s),wa=rows.map(x=>x.wheel_rpm),ba=rows.map(x=>x.ball_rpm);
+  const wd=linearDecel(wt,wa.map(x=>x*2*Math.PI/60)),bd=linearDecel(wt,ba.map(x=>x*2*Math.PI/60));
+  updateMetric('wheelDecel',Number.isFinite(wd)?(wd*60/(2*Math.PI)).toFixed(3)+' RPM/s':'—');
+  updateMetric('ballDecel',Number.isFinite(bd)?(bd*60/(2*Math.PI)).toFixed(3)+' RPM/s':'—');
+  const last=rows.filter(x=>x.pocket_estimate!==null).slice(-1)[0];
+  document.getElementById('pocket').innerHTML='<b>Approximate pocket:</b> '+(last?last.pocket_estimate:'—');
+  document.getElementById('csv').disabled=!rows.length;document.getElementById('json').disabled=!rows.length;
+  setStatus(`Finished ${rows.length} sampled frames. Results are estimates; validate against known wheel motion.`);
+}
+stopBtn.onclick=()=>{running=false;setStatus('Stopping…')};
+
+document.getElementById('csv').onclick=()=>{
+ const keys=Object.keys(rows[0]);const lines=[keys.join(',')];
+ for(const r of rows)lines.push(keys.map(k=>r[k]??'').join(','));
+ download('measurements.csv',lines.join('\n'),'text/csv')
+};
+document.getElementById('json').onclick=()=>{
+ const summary={video:videoMeta.name,fps:30,duration_s:video.duration,rows:rows.length,
+ wheel_rpm_median:median(rows.map(x=>x.wheel_rpm)),ball_rpm_median:median(rows.map(x=>x.ball_rpm)),
+ relative_rpm_median:median(rows.map(x=>x.relative_rpm)),
+ final_pocket_estimate:rows.filter(x=>x.pocket_estimate!==null).slice(-1)[0]?.pocket_estimate??null,
+ note:'Geometric research estimate only; pocket number requires camera/wheel zero calibration.'};
+ download('summary.json',JSON.stringify(summary,null,2),'application/json')
+};
+analyzeBtn.onclick=analyze;
+</script>
+</main>
+</body>
+</html>
